@@ -417,8 +417,4 @@ sudo apt-get install -y python3 python3-venv python3-pip
 
 那么这个仓库就是一个很好的起点。
 
----
 
-## 建议的 README 使用方式
-
-如果你准备把这个仓库对外展示，建议把仓库根目录下原来的极简 README 直接替换为当前版本，并把 `README_LINUX.md` 作为补充说明保留在 `jieli_linux_bundle/` 中。
