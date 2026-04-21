@@ -371,6 +371,8 @@ def interactive_shell(tool: CtpDebugTool, width: int, height: int, fps: int, rat
   open [w h fps rate fmt]        发送 OPEN_RT_STREAM
   raw TOPIC JSON                 发送任意 topic + JSON
   quit
+  sd:xxx                         发送 sd:xxx  指定播放杰里sd卡内音频
+  sd_stop                        发送 sd_stop 停止播放音频
 """.strip()
     tool.logger.log(help_text)
 
@@ -423,6 +425,35 @@ def interactive_shell(tool: CtpDebugTool, width: int, height: int, fps: int, rat
                 continue
             tool.send(topic, payload)
             continue
+        
+        import json
+
+        # sd卡指定音频播放
+        if line.startswith("sd:"):
+            num = line[3:].strip()
+            payload = {
+                "op": "PUT",
+                "param": {
+                    "cmd": "play_sd_num",
+                    "num": num,
+                    "vol": "80"
+                }
+            }
+            tool.send("GENERIC_CMD", json.dumps(payload, separators=(",", ":")))
+            continue
+
+        # 停止播放音频
+        if line.strip() == "sd_stop":
+            payload = {
+                "op": "PUT",
+                "param": {
+                    "cmd": "stop_sd"
+                }
+            }
+            tool.send("GENERIC_CMD", json.dumps(payload, separators=(",", ":")))
+            continue
+
+
 
         tool.logger.log("未知命令，输入 help 查看帮助。")
 
