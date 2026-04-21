@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# 功能：停止普通 UDP、CTP、推理版 UDP、以及保持 stdin 的 tail 进程
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
@@ -19,6 +21,7 @@ done
 
 pkill -f "jieli_min_udp_client.py" 2>/dev/null || true
 pkill -f "jieli_min_ctp_client.py" 2>/dev/null || true
+pkill -f "jieli_rknn_udp_infer.py" 2>/dev/null || true
 pkill -f "tail -f /dev/null" 2>/dev/null || true
 
 echo "[OK] 停止完成。"
