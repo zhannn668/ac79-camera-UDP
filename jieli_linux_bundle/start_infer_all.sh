@@ -149,6 +149,8 @@ ARGS=(
     --nms-thresh "$NMS_THRESH"
 )
 
+
+
 if [[ -n "$LABELS_PATH" ]]; then
     ARGS+=(--labels "$LABELS_PATH")
 fi

@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-在 RK3588 上接收杰理设备发来的 UDP JPEG 实时流，
-使用 RKNNLite 进行 YOLOv8 目标检测，并把结果显示到 LCD 屏幕。
+杰理 UDP JPEG 流 + RKNN 单输出/多输出 YOLO 检测 + LCD 显示
 
-这版修正了两个关键问题：
-1. 输入统一补 batch 维，按 4 维 NHWC 喂给 RKNNLite；
-2. 同时兼容两类常见输出：
-   - 6 个输出张量（Rockchip Model Zoo 常见 YOLOv8 后处理前输出）
-   - 1 个输出张量（Ultralytics 直接导出的 ONNX/RKNN 常见输出）
+这版重点：
+1. 明确按 NHWC 4 维输入喂给 RKNNLite，避免隐式格式转换。
+2. 兼容单输出模型，例如 (1, 5, 8400) 这种 1 类检测模型。
+3. 增加调试信息：打印输出 shape、score 范围、box 范围。
+4. 支持 conf/iou/max_det/agnostic_nms 这些常见 YOLO 参数。
 
-适用前提：
-- 杰理端 OPEN_RT_STREAM 使用 JPEG 模式（format=0）
-- 当前 .rknn 是目标检测模型
+用法示例：
+python3 jieli_rknn_udp_infer_debug.py \
+    --model /path/to/best.rknn \
+    --labels /path/to/labels.txt \
+    --obj-thresh 0.25 \
+    --nms-thresh 0.45 \
+    --max-det 5 \
+    --agnostic-nms
 """
 
 from __future__ import annotations
@@ -32,11 +36,6 @@ from rknnlite.api import RKNNLite
 
 PCM_TYPE_AUDIO = 0x01
 JPEG_TYPE_VIDEO = 0x02
-H264_TYPE_VIDEO = 0x03
-PREVIEW_TYPE = 0x04
-DATE_TIME_TYPE = 0x05
-MEDIA_INFO_TYPE = 0x06
-PLAY_OVER_TYPE = 0x07
 LAST_VIDEO_MARKER = 0x80
 UDP_HEADER_LEN = 20
 
@@ -90,9 +89,7 @@ class FrameState:
         self.buf = bytearray(frame_size)
         self.received = 0
         self.offsets: Set[int] = set()
-        self.created_at = time.time()
-        self.updated_at = self.created_at
-        self.last_seen = False
+        self.updated_at = time.time()
 
     def add_chunk(self, offset: int, payload: bytes, is_last: bool) -> None:
         end = offset + len(payload)
@@ -104,8 +101,6 @@ class FrameState:
         self.offsets.add(offset)
         self.received += len(payload)
         self.updated_at = time.time()
-        if is_last:
-            self.last_seen = True
 
     def is_complete(self) -> bool:
         return self.received >= self.frame_size
@@ -117,7 +112,7 @@ class FrameState:
         return bytes(self.buf[: self.frame_size])
 
 
-class YoloV8RknnDetector:
+class YoloRknnDetector:
     def __init__(
         self,
         model_path: str,
@@ -125,6 +120,8 @@ class YoloV8RknnDetector:
         input_size: Tuple[int, int],
         obj_thresh: float,
         nms_thresh: float,
+        max_det: int,
+        agnostic_nms: bool,
         use_rgb: bool,
         use_all_cores: bool,
         verbose: bool = False,
@@ -134,10 +131,13 @@ class YoloV8RknnDetector:
         self.input_h, self.input_w = input_size
         self.obj_thresh = obj_thresh
         self.nms_thresh = nms_thresh
+        self.max_det = max_det
+        self.agnostic_nms = agnostic_nms
         self.use_rgb = use_rgb
         self.verbose = verbose
         self.rknn = RKNNLite()
         self._logged_output_shapes = False
+        self._logged_score_stats = False
 
         ret = self.rknn.load_rknn(self.model_path)
         if ret != 0:
@@ -167,14 +167,11 @@ class YoloV8RknnDetector:
     @staticmethod
     def _load_labels(labels_path: Optional[str]) -> List[str]:
         if labels_path is None:
-            log("[WARN] 未提供 labels.txt，将使用 class_0/class_1/... 占位名")
             return []
         path = Path(labels_path)
         if not path.exists():
-            log(f"[WARN] labels 文件不存在: {labels_path}，将使用占位名")
             return []
-        lines = [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
-        return lines
+        return [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
     def _class_name(self, class_id: int) -> str:
         if 0 <= class_id < len(self.labels):
@@ -194,108 +191,12 @@ class YoloV8RknnDetector:
         pad_h = (self.input_h - new_h) / 2.0
         left = int(round(pad_w - 0.1))
         top = int(round(pad_h - 0.1))
-
         canvas[top: top + new_h, left: left + new_w] = resized
 
         if self.use_rgb:
             canvas = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
 
-        info = LetterBoxInfo(
-            ratio=ratio,
-            pad_w=pad_w,
-            pad_h=pad_h,
-            new_w=new_w,
-            new_h=new_h,
-        )
-        return canvas, info
-
-    @staticmethod
-    def _reshape_reg(reg: np.ndarray) -> np.ndarray:
-        arr = np.asarray(reg)
-        arr = np.squeeze(arr)
-
-        if arr.ndim != 3:
-            raise ValueError(f"reg 输出维度异常: shape={reg.shape}")
-
-        if arr.shape[0] == 4 * DFL_LEN:
-            arr = np.transpose(arr, (1, 2, 0))
-        elif arr.shape[-1] == 4 * DFL_LEN:
-            pass
-        else:
-            raise ValueError(f"无法识别 reg 输出布局: shape={reg.shape}")
-
-        h, w, c = arr.shape
-        return arr.reshape(h, w, 4, DFL_LEN)
-
-    @staticmethod
-    def _reshape_cls(cls: np.ndarray) -> np.ndarray:
-        arr = np.asarray(cls)
-        arr = np.squeeze(arr)
-
-        if arr.ndim != 3:
-            raise ValueError(f"cls 输出维度异常: shape={cls.shape}")
-
-        if arr.shape[0] < 200 and arr.shape[1] > 4 and arr.shape[2] > 4:
-            arr = np.transpose(arr, (1, 2, 0))
-        elif arr.shape[-1] < 200:
-            pass
-        else:
-            raise ValueError(f"无法识别 cls 输出布局: shape={cls.shape}")
-
-        return arr
-
-    @staticmethod
-    def _softmax_last_dim(x: np.ndarray) -> np.ndarray:
-        x = x - np.max(x, axis=-1, keepdims=True)
-        e = np.exp(x)
-        return e / np.sum(e, axis=-1, keepdims=True)
-
-    def _decode_single_scale(
-        self,
-        reg: np.ndarray,
-        cls: np.ndarray,
-        stride: int,
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        reg_hw = self._reshape_reg(reg)
-        cls_hw = self._reshape_cls(cls)
-        h, w = cls_hw.shape[:2]
-
-        prob = self._softmax_last_dim(reg_hw)
-        project = np.arange(DFL_LEN, dtype=np.float32)
-        dist = np.sum(prob * project, axis=-1)
-
-        scores_all = sigmoid(cls_hw)
-        class_ids = np.argmax(scores_all, axis=-1)
-        scores = np.max(scores_all, axis=-1)
-
-        mask = scores > self.obj_thresh
-        if not np.any(mask):
-            return (
-                np.empty((0, 4), dtype=np.float32),
-                np.empty((0,), dtype=np.float32),
-                np.empty((0,), dtype=np.int32),
-            )
-
-        ys, xs = np.where(mask)
-        chosen_scores = scores[ys, xs].astype(np.float32)
-        chosen_classes = class_ids[ys, xs].astype(np.int32)
-        chosen_dist = dist[ys, xs]
-
-        cx = (xs.astype(np.float32) + 0.5) * stride
-        cy = (ys.astype(np.float32) + 0.5) * stride
-
-        l = chosen_dist[:, 0] * stride
-        t = chosen_dist[:, 1] * stride
-        r = chosen_dist[:, 2] * stride
-        b = chosen_dist[:, 3] * stride
-
-        x1 = cx - l
-        y1 = cy - t
-        x2 = cx + r
-        y2 = cy + b
-
-        boxes = np.stack([x1, y1, x2, y2], axis=1)
-        return boxes, chosen_scores, chosen_classes
+        return canvas, LetterBoxInfo(ratio, pad_w, pad_h, new_w, new_h)
 
     @staticmethod
     def _nms(boxes: np.ndarray, scores: np.ndarray, iou_thr: float) -> List[int]:
@@ -306,13 +207,13 @@ class YoloV8RknnDetector:
         y1 = boxes[:, 1]
         x2 = boxes[:, 2]
         y2 = boxes[:, 3]
-        areas = (x2 - x1).clip(min=0) * (y2 - y1).clip(min=0)
+        areas = np.maximum(0.0, x2 - x1) * np.maximum(0.0, y2 - y1)
         order = scores.argsort()[::-1]
 
         keep: List[int] = []
         while order.size > 0:
-            i = order[0]
-            keep.append(int(i))
+            i = int(order[0])
+            keep.append(i)
             if order.size == 1:
                 break
 
@@ -332,73 +233,6 @@ class YoloV8RknnDetector:
 
         return keep
 
-    def _postprocess_six_outputs(
-        self,
-        outputs: Sequence[np.ndarray],
-        lb: LetterBoxInfo,
-        orig_shape: Tuple[int, int],
-    ) -> List[Tuple[int, float, Tuple[int, int, int, int]]]:
-        regs: List[np.ndarray] = []
-        clss: List[np.ndarray] = []
-        for out in outputs:
-            shape = list(np.asarray(out).shape)
-            if 64 in shape:
-                regs.append(out)
-            else:
-                clss.append(out)
-
-        if len(regs) != 3 or len(clss) != 3:
-            raise ValueError(f"无法把 6 个输出自动分成 3 个 reg + 3 个 cls。reg={len(regs)}, cls={len(clss)}")
-
-        def grid_hw(x: np.ndarray) -> int:
-            arr = np.squeeze(np.asarray(x))
-            if arr.ndim != 3:
-                return -1
-            vals = [v for v in arr.shape if v not in (64,) and v < 200]
-            vals = [v for v in vals if v > 4]
-            return max(vals) if vals else -1
-
-        regs.sort(key=grid_hw, reverse=True)
-        clss.sort(key=grid_hw, reverse=True)
-
-        all_boxes: List[np.ndarray] = []
-        all_scores: List[np.ndarray] = []
-        all_classes: List[np.ndarray] = []
-
-        for reg, cls, stride in zip(regs, clss, STRIDES):
-            boxes, scores, class_ids = self._decode_single_scale(reg, cls, stride)
-            if len(boxes) == 0:
-                continue
-            all_boxes.append(boxes)
-            all_scores.append(scores)
-            all_classes.append(class_ids)
-
-        if not all_boxes:
-            return []
-
-        boxes = np.concatenate(all_boxes, axis=0)
-        scores = np.concatenate(all_scores, axis=0)
-        class_ids = np.concatenate(all_classes, axis=0)
-
-        orig_h, orig_w = orig_shape
-        boxes[:, [0, 2]] -= lb.pad_w
-        boxes[:, [1, 3]] -= lb.pad_h
-        boxes[:, :4] /= lb.ratio
-
-        boxes[:, [0, 2]] = np.clip(boxes[:, [0, 2]], 0, orig_w - 1)
-        boxes[:, [1, 3]] = np.clip(boxes[:, [1, 3]], 0, orig_h - 1)
-
-        results: List[Tuple[int, float, Tuple[int, int, int, int]]] = []
-        for cls_id in np.unique(class_ids):
-            inds = np.where(class_ids == cls_id)[0]
-            cls_boxes = boxes[inds]
-            cls_scores = scores[inds]
-            keep = self._nms(cls_boxes, cls_scores, self.nms_thresh)
-            for k in keep:
-                x1, y1, x2, y2 = cls_boxes[k]
-                results.append((int(cls_id), float(cls_scores[k]), (int(x1), int(y1), int(x2), int(y2))))
-        return results
-
     def _postprocess_single_output(
         self,
         output: np.ndarray,
@@ -406,10 +240,10 @@ class YoloV8RknnDetector:
         orig_shape: Tuple[int, int],
     ) -> List[Tuple[int, float, Tuple[int, int, int, int]]]:
         """
-        兼容 Ultralytics 常见单输出：
-        - [1, C, N]
-        - [1, N, C]
-        其中 C 常见为 4+num_classes
+        兼容常见单输出：
+        - (1, 5, 8400)  -> 单类，格式通常是 xywh + cls
+        - (1, 84, 8400) -> 多类，格式通常是 xywh + cls...
+        - (1, 8400, 5/84)
         """
         arr = np.asarray(output)
         arr = np.squeeze(arr)
@@ -417,37 +251,44 @@ class YoloV8RknnDetector:
         if arr.ndim != 2:
             raise ValueError(f"单输出模型当前只支持 2 维主体张量，实际 shape={output.shape}")
 
-        num_classes = max(1, len(self.labels))
-        candidate_channels = 4 + num_classes
-
-        # [C, N] -> [N, C]
-        if arr.shape[0] == candidate_channels and arr.shape[1] > arr.shape[0]:
+        # 转成 [N, C]
+        if arr.shape[0] < arr.shape[1]:
             arr = arr.T
-        # [N, C]
-        elif arr.shape[1] == candidate_channels:
-            pass
-        else:
-            # 退一步：如果最后一维 >= 5，就当 [N,C] 处理
-            if arr.shape[1] >= 5:
-                pass
-            elif arr.shape[0] >= 5:
-                arr = arr.T
-            else:
-                raise ValueError(f"无法识别单输出张量布局: shape={output.shape}")
 
         if arr.shape[1] < 5:
-            raise ValueError(f"单输出张量列数异常，至少应包含 4 个框参数 + 1 个分数，实际 shape={arr.shape}")
+            raise ValueError(f"单输出张量列数异常，至少应为 5，实际 shape={arr.shape}")
 
         boxes_xywh = arr[:, :4].astype(np.float32)
+        cls_scores = arr[:, 4:].astype(np.float32)
 
-        if arr.shape[1] == 5:
-            scores = arr[:, 4].astype(np.float32)
+        # 输出调试
+        if not self._logged_score_stats:
+            log(f"[INFO] 单输出主体 shape(转置后): {arr.shape}")
+            log(f"[INFO] box min/max: {boxes_xywh.min():.4f} / {boxes_xywh.max():.4f}")
+            log(f"[INFO] score min/max(before): {cls_scores.min():.6f} / {cls_scores.max():.6f}")
+            self._logged_score_stats = True
+
+        # 自适应是否需要 sigmoid
+        if cls_scores.max() > 1.0 or cls_scores.min() < 0.0:
+            cls_scores = sigmoid(cls_scores)
+            log("[INFO] 检测到 score 超出 [0,1]，已自动对 score 做 sigmoid")
+
+        if cls_scores.shape[1] == 1:
+            scores = cls_scores[:, 0]
             class_ids = np.zeros((arr.shape[0],), dtype=np.int32)
         else:
-            cls_scores = arr[:, 4:].astype(np.float32)
-            # 这里大多数 Ultralytics 导出已经做过 sigmoid；若没做，数值通常会很奇怪。
             class_ids = np.argmax(cls_scores, axis=1).astype(np.int32)
             scores = np.max(cls_scores, axis=1).astype(np.float32)
+
+        if not self._logged_output_shapes:
+            log(f"[INFO] score min/max(after): {scores.min():.6f} / {scores.max():.6f}")
+            self._logged_output_shapes = True
+
+        # 如果框是归一化坐标，缩放到输入尺寸
+        if boxes_xywh.max() <= 2.0:
+            boxes_xywh[:, [0, 2]] *= self.input_w
+            boxes_xywh[:, [1, 3]] *= self.input_h
+            log("[INFO] 检测到 box 范围较小，按归一化 xywh 处理并放大到输入尺寸")
 
         mask = scores > self.obj_thresh
         if not np.any(mask):
@@ -457,7 +298,6 @@ class YoloV8RknnDetector:
         scores = scores[mask]
         class_ids = class_ids[mask]
 
-        # 这里按 Ultralytics 常见单输出解释：xywh, 基于 letterbox 后输入图尺度
         cx = boxes_xywh[:, 0]
         cy = boxes_xywh[:, 1]
         w = boxes_xywh[:, 2]
@@ -467,9 +307,9 @@ class YoloV8RknnDetector:
         y1 = cy - h / 2.0
         x2 = cx + w / 2.0
         y2 = cy + h / 2.0
-
         boxes = np.stack([x1, y1, x2, y2], axis=1)
 
+        # 从 letterbox 输入图映射回原图
         orig_h, orig_w = orig_shape
         boxes[:, [0, 2]] -= lb.pad_w
         boxes[:, [1, 3]] -= lb.pad_h
@@ -479,6 +319,15 @@ class YoloV8RknnDetector:
         boxes[:, [1, 3]] = np.clip(boxes[:, [1, 3]], 0, orig_h - 1)
 
         results: List[Tuple[int, float, Tuple[int, int, int, int]]] = []
+
+        if self.agnostic_nms:
+            keep = self._nms(boxes, scores, self.nms_thresh)
+            keep = keep[: self.max_det]
+            for k in keep:
+                x1, y1, x2, y2 = boxes[k]
+                results.append((int(class_ids[k]), float(scores[k]), (int(x1), int(y1), int(x2), int(y2))))
+            return results
+
         for cls_id in np.unique(class_ids):
             inds = np.where(class_ids == cls_id)[0]
             cls_boxes = boxes[inds]
@@ -487,33 +336,29 @@ class YoloV8RknnDetector:
             for k in keep:
                 x1, y1, x2, y2 = cls_boxes[k]
                 results.append((int(cls_id), float(cls_scores[k]), (int(x1), int(y1), int(x2), int(y2))))
-        return results
+
+        results.sort(key=lambda x: x[1], reverse=True)
+        return results[: self.max_det]
 
     def infer(self, image_bgr: np.ndarray) -> List[Tuple[int, float, Tuple[int, int, int, int]]]:
         blob, lb = self._letterbox(image_bgr)
-
-        # 当前运行时提示实际需要 NHWC，所以直接按 NHWC 喂 4 维输入
         blob = np.expand_dims(blob, axis=0)
         blob = np.ascontiguousarray(blob)
 
-        outputs = self.rknn.inference(inputs=[blob])
+        outputs = self.rknn.inference(inputs=[blob], data_format=['nhwc'])
         if outputs is None:
             raise RuntimeError("rknn.inference() 返回了 None")
 
-        if not self._logged_output_shapes:
+        if not hasattr(self, "_printed_shapes"):
             shapes = [tuple(np.asarray(o).shape) for o in outputs]
             log(f"[INFO] 模型输出数量: {len(outputs)}")
             log(f"[INFO] 模型输出 shape: {shapes}")
-            self._logged_output_shapes = True
+            self._printed_shapes = True
 
         if len(outputs) == 1:
             return self._postprocess_single_output(outputs[0], lb, image_bgr.shape[:2])
-        if len(outputs) == 6:
-            return self._postprocess_six_outputs(outputs, lb, image_bgr.shape[:2])
 
-        raise ValueError(
-            f"当前代码只兼容 1 输出或 6 输出模型，你这个模型实际输出 {len(outputs)} 个。"
-        )
+        raise ValueError(f"当前调试版主要针对单输出模型，你这个模型输出 {len(outputs)} 个，需另外对齐。")
 
     def draw(self, image_bgr: np.ndarray, results: List[Tuple[int, float, Tuple[int, int, int, int]]]) -> np.ndarray:
         vis = image_bgr.copy()
@@ -536,7 +381,7 @@ class JieliRknnUdpInfer:
         show_window: bool,
         fullscreen: bool,
         display_size: Optional[Tuple[int, int]],
-        detector: YoloV8RknnDetector,
+        detector: YoloRknnDetector,
         verbose: bool,
     ) -> None:
         self.bind_ip = bind_ip
@@ -554,8 +399,6 @@ class JieliRknnUdpInfer:
         self.sock.settimeout(1.0)
 
         self.frames: Dict[int, FrameState] = {}
-        self.packet_count = 0
-        self.frame_count = 0
         self.fps_counter = FPSCounter()
         self.window_name = "Jieli RKNN Infer"
         self.window_inited = False
@@ -563,8 +406,6 @@ class JieliRknnUdpInfer:
         log(f"[INFO] UDP 监听: {self.bind_ip}:{self.bind_port}")
         if self.device_ip:
             log(f"[INFO] 仅接收设备 IP: {self.device_ip}")
-        else:
-            log("[INFO] 已关闭设备 IP 过滤")
         log(f"[INFO] 显示窗口: {'开' if self.show_window else '关'}")
 
     def close(self) -> None:
@@ -594,28 +435,16 @@ class JieliRknnUdpInfer:
     def _cleanup_stale_frames(self) -> None:
         stale_keys = [seq for seq, st in self.frames.items() if st.age() > self.cleanup_timeout]
         for seq in stale_keys:
-            st = self.frames.pop(seq)
-            if self.verbose:
-                log(f"[CLEAN] 丢弃超时帧 seq={seq} recv={st.received}/{st.frame_size} age={st.age():.2f}s")
+            self.frames.pop(seq, None)
 
     def _handle_complete_frame(self, state: FrameState) -> bool:
-        self.frame_count += 1
         payload = state.to_bytes()
-
-        if not payload.startswith(b"\xFF\xD8"):
-            if self.verbose:
-                log(f"[DROP] seq={state.seq} 不是 JPEG SOI")
-            return False
-        if b"\xFF\xD9" not in payload:
-            if self.verbose:
-                log(f"[DROP] seq={state.seq} 缺少 JPEG EOI")
+        if not payload.startswith(b"\xFF\xD8") or b"\xFF\xD9" not in payload:
             return False
 
         arr = np.frombuffer(payload, dtype=np.uint8)
         frame_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
         if frame_bgr is None:
-            if self.verbose:
-                log(f"[DROP] seq={state.seq} JPEG 解码失败")
             return False
 
         try:
@@ -627,10 +456,8 @@ class JieliRknnUdpInfer:
         vis = self.detector.draw(frame_bgr, results)
         fps = self.fps_counter.update()
 
-        text1 = f"FPS: {fps:.1f}  SEQ: {state.seq}"
-        text2 = f"DET: {len(results)}  TS: {state.timestamp}"
-        cv2.putText(vis, text1, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2)
-        cv2.putText(vis, text2, (10, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+        cv2.putText(vis, f"FPS: {fps:.1f}  DET: {len(results)}", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2)
 
         if self.display_size is not None:
             vis = cv2.resize(vis, self.display_size)
@@ -641,13 +468,9 @@ class JieliRknnUdpInfer:
             key = cv2.waitKey(1) & 0xFF
             if key in (27, ord('q')):
                 return True
-
-        if self.verbose:
-            log(f"[FRAME] seq={state.seq} det={len(results)} fps={fps:.1f}")
         return False
 
     def _parse_udp_packet(self, packet: bytes, addr: Tuple[str, int]) -> bool:
-        self.packet_count += 1
         if self.device_ip and addr[0] != self.device_ip:
             return False
 
@@ -662,19 +485,13 @@ class JieliRknnUdpInfer:
                 break
 
             pos += UDP_HEADER_LEN
-            if payload_len == 0:
-                continue
-            if pos + payload_len > plen:
-                if self.verbose:
-                    log(f"[WARN] 畸形 UDP 包 from={addr[0]}:{addr[1]} payload_len={payload_len}")
+            if payload_len == 0 or pos + payload_len > plen:
                 break
 
             payload = packet[pos: pos + payload_len]
             pos += payload_len
 
             base_type = media_type & 0x7F
-            is_last = bool(media_type & LAST_VIDEO_MARKER)
-
             if base_type != JPEG_TYPE_VIDEO:
                 continue
 
@@ -683,11 +500,10 @@ class JieliRknnUdpInfer:
                 st = FrameState(seq=seq, frame_size=frame_size, timestamp=timestamp, media_type=media_type)
                 self.frames[seq] = st
 
-            st.add_chunk(offset=offset, payload=payload, is_last=is_last)
+            st.add_chunk(offset=offset, payload=payload, is_last=bool(media_type & LAST_VIDEO_MARKER))
             if st.is_complete():
                 self.frames.pop(seq, None)
-                should_quit = self._handle_complete_frame(st)
-                if should_quit:
+                if self._handle_complete_frame(st):
                     return True
 
         return False
@@ -701,11 +517,10 @@ class JieliRknnUdpInfer:
                     self._cleanup_stale_frames()
                     continue
 
-                should_quit = self._parse_udp_packet(packet, addr)
-                self._cleanup_stale_frames()
-                if should_quit:
+                if self._parse_udp_packet(packet, addr):
                     log("[INFO] 按下 q / ESC，程序退出")
                     return 0
+                self._cleanup_stale_frames()
         except KeyboardInterrupt:
             print()
             log("[INFO] Ctrl+C 退出")
@@ -715,25 +530,27 @@ class JieliRknnUdpInfer:
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="杰理 UDP JPEG 流 + RKNN YOLOv8 推理 + LCD 显示")
-    p.add_argument("--bind-ip", default="0.0.0.0", help="本地监听 IP，默认 0.0.0.0")
-    p.add_argument("--port", type=int, default=2224, help="UDP 端口，默认 2224")
-    p.add_argument("--device-ip", default="192.168.1.1", help="只接收该设备 IP，默认 192.168.1.1")
-    p.add_argument("--no-filter", action="store_true", help="关闭设备 IP 过滤")
-    p.add_argument("--cleanup-timeout", type=float, default=3.0, help="分片帧超时清理时间，默认 3 秒")
+    p = argparse.ArgumentParser(description="杰理 UDP JPEG 流 + RKNN 检测 + LCD 显示（单输出调试版）")
+    p.add_argument("--bind-ip", default="0.0.0.0")
+    p.add_argument("--port", type=int, default=2224)
+    p.add_argument("--device-ip", default="192.168.1.1")
+    p.add_argument("--no-filter", action="store_true")
+    p.add_argument("--cleanup-timeout", type=float, default=3.0)
 
-    p.add_argument("--model", required=True, help=".rknn 模型路径")
-    p.add_argument("--labels", default=None, help="类别文件，每行一个类别名")
-    p.add_argument("--input-size", nargs=2, type=int, default=[640, 640], metavar=("W", "H"), help="模型输入尺寸")
-    p.add_argument("--obj-thresh", type=float, default=0.25, help="目标置信度阈值")
-    p.add_argument("--nms-thresh", type=float, default=0.45, help="NMS 阈值")
-    p.add_argument("--bgr-input", action="store_true", help="如果模型需要 BGR 输入而不是 RGB，就加这个参数")
-    p.add_argument("--single-core", action="store_true", help="只用默认单核运行，不启用 0_1_2 三核")
+    p.add_argument("--model", required=True)
+    p.add_argument("--labels", default=None)
+    p.add_argument("--input-size", nargs=2, type=int, default=[640, 640], metavar=("W", "H"))
+    p.add_argument("--obj-thresh", type=float, default=0.25)
+    p.add_argument("--nms-thresh", type=float, default=0.45)
+    p.add_argument("--max-det", type=int, default=5)
+    p.add_argument("--agnostic-nms", action="store_true")
+    p.add_argument("--bgr-input", action="store_true")
+    p.add_argument("--single-core", action="store_true")
 
-    p.add_argument("--no-window", action="store_true", help="不显示窗口，只跑接收和推理")
-    p.add_argument("--fullscreen", action="store_true", help="全屏显示到 LCD")
-    p.add_argument("--display-size", nargs=2, type=int, default=None, metavar=("W", "H"), help="显示缩放尺寸")
-    p.add_argument("--verbose", action="store_true", help="打印更多日志")
+    p.add_argument("--no-window", action="store_true")
+    p.add_argument("--fullscreen", action="store_true")
+    p.add_argument("--display-size", nargs=2, type=int, default=None, metavar=("W", "H"))
+    p.add_argument("--verbose", action="store_true")
     return p
 
 
@@ -745,12 +562,14 @@ def main() -> int:
         print(f"[FATAL] .rknn 模型不存在: {model_path}")
         return 1
 
-    detector = YoloV8RknnDetector(
+    detector = YoloRknnDetector(
         model_path=str(model_path),
         labels_path=args.labels,
         input_size=(args.input_size[1], args.input_size[0]),
         obj_thresh=args.obj_thresh,
         nms_thresh=args.nms_thresh,
+        max_det=args.max_det,
+        agnostic_nms=args.agnostic_nms,
         use_rgb=not args.bgr_input,
         use_all_cores=not args.single_core,
         verbose=args.verbose,
